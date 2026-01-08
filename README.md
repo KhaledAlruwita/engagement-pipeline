@@ -1,279 +1,245 @@
-ENGAGEMENT PIPELINE – STREAMING SYSTEM
-====================================
+ENGAGEMENT STREAMING PIPELINE
+=============================
 
-1. OVERVIEW
------------
-This project implements a real-time data streaming pipeline that captures new
-rows from a PostgreSQL table (engagement_events), enriches each event, and
-fan-outs the enriched data to three different destinations:
+This project implements a real-time data streaming system that captures
+new rows from a PostgreSQL table, enriches them, and fans out the results
+to multiple destinations with low latency and high reliability.
 
-1) ClickHouse (analytics / reporting – BigQuery alternative)
-2) Redis (real-time & last-10-minutes aggregations)
-3) External HTTP API (system outside our control)
+--------------------------------------------------
+1. WHAT THIS SYSTEM DOES
+--------------------------------------------------
 
-The system is designed to be practical, fault-tolerant, reproducible, and easy
-to run locally using Docker Compose.
+The system performs the following:
 
+1) Streams new rows from PostgreSQL table: engagement_events
+2) Enriches each event by joining with the content table
+3) Derives new metrics:
+   - engagement_seconds = duration_ms / 1000
+   - engagement_pct = engagement_seconds / length_seconds (rounded to 2 decimals)
+4) Sends enriched events to THREE destinations in real time:
+   - ClickHouse (analytics / reporting – BigQuery alternative)
+   - Redis (real-time use cases, < 5 seconds latency)
+   - External HTTP API (system we do not control)
+5) Maintains rolling aggregations in Redis:
+   - Top content in the last 10 minutes
+6) Supports backfilling historical data
+7) Uses a streaming engine with checkpointing for reliable processing
 
-2. BUSINESS GOAL
-----------------
-The pipeline enables:
-- Real-time engagement analytics
-- Near real-time updates (< 5 seconds) for Redis
-- Historical analytics via a columnar database
-- Safe integration with external systems
-- Reprocessing (backfill) of historical data
+--------------------------------------------------
+2. HIGH-LEVEL ARCHITECTURE
+--------------------------------------------------
 
+PostgreSQL
+  |
+  | (CDC via Debezium)
+  v
+Kafka
+  |
+  | (Structured Streaming)
+  v
+Spark Structured Streaming
+  |
+  |---> ClickHouse (Analytics Store)
+  |
+  |---> Redis (Real-time Store + Aggregations)
+  |
+  |---> External API (HTTP)
 
-3. HIGH-LEVEL ARCHITECTURE
---------------------------
-Postgres
-  └─(CDC via Debezium)
-      └─ Kafka
-          └─ Spark Structured Streaming
-              ├─ ClickHouse (analytics)
-              ├─ Redis (real-time & aggregations)
-              └─ External API (HTTP)
+--------------------------------------------------
+3. DATA FLOW EXPLAINED STEP BY STEP
+--------------------------------------------------
 
-
-4. DATA FLOW – STEP BY STEP
----------------------------
-
-STEP 0 – SOURCE (Postgres)
---------------------------
-Tables:
-- engagement_events (fact table)
-- content (dimension table)
+STEP 1 – SOURCE (PostgreSQL)
+----------------------------
+- New events are inserted into:
+  public.engagement_events
+- Reference data lives in:
+  public.content
 
 Example insert:
 INSERT INTO engagement_events
 (content_id, user_id, event_type, duration_ms, device)
 VALUES (1, 999, 'play', 7000, 'web');
 
+--------------------------------------------------
 
-STEP 1 – CDC (Debezium)
-----------------------
-- Debezium monitors Postgres WAL.
-- Every INSERT becomes a JSON event.
-- Only CREATE operations (op = "c") are processed.
+STEP 2 – CDC (Debezium)
+-----------------------
+- Debezium reads PostgreSQL WAL (write-ahead log)
+- Every INSERT is converted into a JSON event
+- No polling, no triggers, no application changes
 
-Output: Kafka message (JSON).
+--------------------------------------------------
 
+STEP 3 – MESSAGE TRANSPORT (Kafka)
+----------------------------------
+- Debezium publishes events to Kafka topics
+- Kafka provides:
+  - Buffering
+  - Replay capability
+  - Fault tolerance
 
-STEP 2 – TRANSPORT (Kafka)
---------------------------
-Topic:
-- dbserver1.public.engagement_events
+--------------------------------------------------
 
-Kafka acts as:
-- Buffer
-- Decoupling layer
-- Replay mechanism (offset-based)
+STEP 4 – STREAM PROCESSING (Spark Structured Streaming)
+-------------------------------------------------------
+Spark reads events from Kafka and performs:
 
-
-STEP 3 – STREAM INGESTION (Spark)
---------------------------------
-Spark Structured Streaming:
-- Reads Kafka topic
-- Parses Debezium JSON
-- Extracts the "after" payload
-- Filters only INSERT events
-
-
-STEP 4 – ENRICHMENT & TRANSFORMATION
-------------------------------------
-Spark joins each event with the content table:
-
-Join:
-- engagement_events.content_id = content.content_id
+1) JSON parsing
+2) Filtering only INSERT operations
+3) Joining with content table
+4) Deriving new fields
 
 Derived fields:
 - engagement_seconds = duration_ms / 1000
 - engagement_pct = round(engagement_seconds / length_seconds, 2)
 
-Null handling:
-- If duration_ms or length_seconds is missing:
-  engagement_seconds = NULL
-  engagement_pct = NULL
+If duration_ms or length_seconds is missing:
+- engagement_seconds = NULL
+- engagement_pct = NULL
 
+--------------------------------------------------
 
 STEP 5 – MULTI-SINK FAN-OUT
 ---------------------------
-Using foreachBatch, Spark writes each micro-batch to:
+Each micro-batch is written to THREE sinks:
 
 A) ClickHouse
+--------------
+- Column-oriented analytics database
+- Stores enriched events for reporting and analysis
+- Acts as a BigQuery alternative
+
 B) Redis
-C) External HTTP API
+---------
+Used for real-time use cases:
+- content:last:{content_id}    -> last event per content
+- content:count:{content_id}   -> total events counter
+- top:content:bucket:{minute}  -> per-minute aggregation
+- top:content:10m              -> merged top content for last 10 minutes
 
-All sinks receive the same enriched dataset.
+Redis updates arrive within < 5 seconds of the event.
 
-
-5. DATA MODEL (ENRICHED EVENT)
-------------------------------
-Example enriched record:
-
-{
-  "event_id": 16,
-  "content_id": 1,
-  "user_id": 999,
-  "event_type": "play",
-  "event_ts": "2026-01-08 14:21:52",
-  "duration_ms": 7000,
-  "device": "web",
-  "content_type": "video",
-  "length_seconds": 300,
-  "engagement_seconds": 7.0,
-  "engagement_pct": 0.02
-}
-
-
-6. SINK DETAILS
+C) External API
 ---------------
+- HTTP POST endpoint
+- Represents a system outside our control
+- Demonstrates integration with unreliable external services
 
-6.1 ClickHouse (Analytics Store)
---------------------------------
-Purpose:
-- Reporting & analytics (BigQuery alternative)
+--------------------------------------------------
+4. EXACTLY-ONCE & FAILURE HANDLING
+--------------------------------------------------
 
-Table:
-- engagement.events_enriched
+- Spark uses checkpointing to track Kafka offsets
+- On restart, processing resumes from the last committed state
+- Idempotency is enforced using event_id to avoid duplicates
+- External API failures can be retried or isolated depending on policy
 
-Write mode:
-- Append only
+--------------------------------------------------
+5. BACKFILL SUPPORT
+--------------------------------------------------
 
-Use cases:
-- Time-based analytics
-- Aggregations
-- Dashboards
+A dedicated backfill script allows reprocessing historical data:
 
+- Reads events from PostgreSQL for a given time range
+- Applies the SAME transformations as the streaming job
+- Writes to ClickHouse and Redis
 
-6.2 Redis (Real-Time Store)
+This ensures consistency between real-time and historical data.
+
+--------------------------------------------------
+6. HOW TO RUN THE SYSTEM
+--------------------------------------------------
+
+PREREQUISITES
+-------------
+- Docker
+- Docker Compose
+
+--------------------------------------------------
+
+STEP 1 – Start all services
 ---------------------------
-Redis supports low-latency (< 5s) use cases.
+docker compose up -d
 
-Keys used:
+This starts:
+- PostgreSQL
+- Kafka + Zookeeper
+- Debezium Connect
+- Spark (master + workers)
+- ClickHouse
+- Redis
+- External API
 
-1) Last event per content
-   Key: content:last:{content_id}
-   Value: JSON enriched event
-   TTL: 1 hour
+--------------------------------------------------
 
-2) Event count per content
-   Key: content:count:{content_id}
-   Value: integer (INCR)
+STEP 2 – Register Debezium Connector
+------------------------------------
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @connectors/engagement-events-connector.json
 
-3) Per-minute aggregation buckets
-   Key: top:content:bucket:{YYYYMMDDHHMM}
-   Type: ZSET
-   Member: content_id
-   Score: number of events in that minute
-   TTL: 15 minutes
+--------------------------------------------------
 
-4) Last 10 minutes aggregation
-   Key: top:content:10m
-   Type: ZSET
-   Built by merging the last 10 minute buckets
-   TTL: 120 seconds
-
-
-6.3 External API (Uncontrolled System)
+STEP 3 – Start the Spark Streaming Job
 --------------------------------------
-Purpose:
-- Demonstrate integration with a system we do not control
+docker exec -it spark-client bash -lc "
+/opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/spark-apps/01_kafka_to_clickhouse.py
+"
 
-Implementation:
-- FastAPI mock service
-- Endpoint: POST /events
+--------------------------------------------------
 
-Behavior:
-- Receives enriched events as JSON
-- Returns HTTP 200 OK
-- Can be extended to simulate failures or delays
+STEP 4 – Insert Test Data
+-------------------------
+docker exec -it pg psql -U app -d engagement -c "
+INSERT INTO engagement_events
+(content_id, user_id, event_type, duration_ms, device)
+VALUES (1, 999, 'play', 7000, 'web');
+"
 
+--------------------------------------------------
 
-7. PARTITIONING STRATEGY
-------------------------
-Kafka:
-- Logical partition key: content_id
-- Ensures ordering per content if needed
-
-Spark:
-- Controlled shuffle partitions to reduce overhead
+STEP 5 – Verify Outputs
+-----------------------
 
 ClickHouse:
-- ORDER BY (event_ts, content_id, event_id)
-- Optimized for time-based queries
+docker exec -it clickhouse clickhouse-client -q "
+SELECT * FROM engagement.events_enriched ORDER BY event_id DESC LIMIT 5;
+"
 
+Redis:
+docker exec -it redis redis-cli GET content:last:1
+docker exec -it redis redis-cli ZREVRANGE top:content:10m 0 10 WITHSCORES
 
-8. FAULT TOLERANCE & EXACTLY-ONCE
----------------------------------
-Spark:
-- Uses checkpointing to track offsets and state
-- On restart, resumes from last committed offsets
+External API:
+docker logs -f external-api
 
-Kafka:
-- Guarantees at-least-once delivery
-- Spark checkpointing ensures exactly-once processing
+--------------------------------------------------
+7. WHY THIS DESIGN
+--------------------------------------------------
 
-Redis & External API:
-- Idempotency handled via event_id
-- Duplicate events can be safely ignored
+- Debezium avoids polling and ensures low-latency CDC
+- Kafka decouples producers and consumers
+- Spark Structured Streaming provides:
+  - Exactly-once processing
+  - Checkpointing
+  - Multi-sink fan-out
+- Redis serves real-time, low-latency use cases
+- ClickHouse enables fast analytical queries
+- Docker Compose ensures reproducibility
 
+--------------------------------------------------
+8. POSSIBLE FUTURE IMPROVEMENTS
+--------------------------------------------------
 
-9. BACKFILL (HISTORICAL REPROCESSING)
--------------------------------------
-Tool:
-- tools/backfill.py
+- Dead-letter queue for failed external API calls
+- Schema Registry for Kafka
+- Alerting and monitoring (Prometheus + Grafana)
+- Stateful deduplication using event-time watermarks
+- Deployment on Kubernetes
 
-Behavior:
-- Reads historical data from Postgres within a time range
-- Applies the same transformations as streaming
-- Writes to ClickHouse and Redis
-- Uses idempotency keys to avoid duplicates
-
-Example:
-python backfill.py --start 2026-01-08T09:00:00 --end 2026-01-08T10:00:00
-
-
-10. RUNNING THE SYSTEM
----------------------
-1) Start all services:
-   docker compose up -d
-
-2) Start Spark streaming jobs:
-   - Kafka → ClickHouse
-   - ClickHouse → Redis & External API
-
-3) Insert data into Postgres:
-   INSERT INTO engagement_events (...)
-
-4) Observe:
-   - ClickHouse tables
-   - Redis keys
-   - External API logs
-
-
-11. REQUIREMENTS COVERAGE
--------------------------
-✔ Streaming from engagement_events
-✔ Enrichment via content table
-✔ Derived metrics (engagement_seconds, engagement_pct)
-✔ Multi-sink fan-out
-✔ Redis updates < 5 seconds
-✔ 10-minute rolling aggregations
-✔ Backfill support
-✔ Exactly-once processing (practical)
-✔ Reproducible environment (Docker)
-
-
-12. FUTURE IMPROVEMENTS
------------------------
-- Dead Letter Queue (DLQ) for failed external calls
-- Schema Registry (Avro/Protobuf)
-- Real BigQuery sink
-- Monitoring & alerting (Prometheus / Grafana)
-- Rate limiting & retries for external API
-
-
-END OF DOCUMENT
-====================================
+--------------------------------------------------
+END
+--------------------------------------------------
