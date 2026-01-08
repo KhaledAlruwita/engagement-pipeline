@@ -1,5 +1,5 @@
 
-# ENGAGEMENT STREAMING PIPELINE
+# Engagement streaming pipeline
 
 a real-time data streaming system that captures
 new rows from a PostgreSQL table, enriches them, and fans out the results
