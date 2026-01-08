@@ -1,0 +1,29 @@
+{
+  "name": "engagement-events-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+
+    "database.hostname": "pg",
+    "database.port": "5432",
+    "database.user": "app",
+    "database.password": "app",
+    "database.dbname": "engagement",
+
+    "topic.prefix": "dbserver1",
+
+    "table.include.list": "public.engagement_events",
+
+    "plugin.name": "pgoutput",
+
+    "slot.name": "engagement_slot",
+    "publication.autocreate.mode": "filtered",
+
+    "tombstones.on.delete": "false",
+    "decimal.handling.mode": "string",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false"
+  }
+}
