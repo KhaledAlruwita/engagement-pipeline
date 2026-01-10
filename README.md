@@ -5,6 +5,7 @@ a real-time data streaming system that captures
 new rows from a PostgreSQL table, enriches them, and fans out the results
 to multiple destinations with low latency and high reliability.
 
+please find the full document [here](docs/engagement.pdf)
 
 
 ## What it does
